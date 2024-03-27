@@ -26,6 +26,9 @@ const (
 	rdsLabelEngineVersion = rdsLabel + "engine_version"
 	rdsLabelTag           = rdsLabel + "tag_"
 	rdsLabelVPCID         = rdsLabel + "vpc_id"
+	rdsLabelCluster       = rdsLabel + "cluster"
+	rdsLabelInstanceRole  = rdsLabel + "role"
+	rdsLabelRegion        = rdsLabel + "region"
 )
 
 type discovery struct {
@@ -49,71 +52,103 @@ func newDiscovery(conf sdConfig, logger log.Logger) (*discovery, error) {
 }
 
 func (d *discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
-	for c := time.Tick(time.Duration(d.refreshInterval) * time.Second); ; {
-		var tgs []*targetgroup.Group
+    for c := time.Tick(time.Duration(d.refreshInterval) * time.Second); ; {
+        var tgs []*targetgroup.Group
 
-		sess := session.Must(session.NewSession())
-		client := rds.New(sess)
+        sess := session.Must(session.NewSession())
+        client := rds.New(sess)
 
-		input := &rds.DescribeDBInstancesInput{
-			Filters: d.filters,
+        clusterWriterMap := make(map[string]bool)
+
+	// Cluster
+        err := client.DescribeDBClustersPagesWithContext(ctx, &rds.DescribeDBClustersInput{},
+            func(page *rds.DescribeDBClustersOutput, lastPage bool) bool {
+                for _, cluster := range page.DBClusters {
+                    for _, member := range cluster.DBClusterMembers {
+                        if member.IsClusterWriter != nil && *member.IsClusterWriter {
+                            clusterWriterMap[*member.DBInstanceIdentifier] = true
+                        }
+                    }
+                }
+                return !lastPage
+            },
+        )
+        if err != nil {
+            level.Error(d.logger).Log("msg", "could not describe db clusters", "err", err)
+            continue
+        }
+
+        input := &rds.DescribeDBInstancesInput{
+            Filters: d.filters,
+        }
+	// Instance
+	if err := client.DescribeDBInstancesPagesWithContext(ctx, input, func(out *rds.DescribeDBInstancesOutput, lastPage bool) bool {
+            for _, dbi := range out.DBInstances {
+                labels := model.LabelSet{
+                    rdsLabelInstanceID: model.LabelValue(*dbi.DBInstanceIdentifier),
+                }
+		labels[rdsLabelAZ] = model.LabelValue(*dbi.AvailabilityZone)
+		labels[rdsLabelInstanceState] = model.LabelValue(*dbi.DBInstanceStatus)
+		labels[rdsLabelInstanceType] = model.LabelValue(*dbi.DBInstanceClass)
+
+		addr := net.JoinHostPort(*dbi.Endpoint.Address, strconv.FormatInt(*dbi.Endpoint.Port, 10))
+		labels[model.AddressLabel] = model.LabelValue(addr)
+
+		labels[rdsLabelEngine] = model.LabelValue(*dbi.Engine)
+		labels[rdsLabelEngineVersion] = model.LabelValue(*dbi.EngineVersion)
+
+		labels[rdsLabelVPCID] = model.LabelValue(*dbi.DBSubnetGroup.VpcId)
+
+		if dbi.DBClusterIdentifier != nil {
+    			labels[rdsLabelCluster] = model.LabelValue(*dbi.DBClusterIdentifier)
 		}
 
-		if err := client.DescribeDBInstancesPagesWithContext(ctx, input, func(out *rds.DescribeDBInstancesOutput, lastPage bool) bool {
-			for _, dbi := range out.DBInstances {
-				labels := model.LabelSet{
-					rdsLabelInstanceID: model.LabelValue(*dbi.DBInstanceIdentifier),
-				}
+                if _, ok := clusterWriterMap[*dbi.DBInstanceIdentifier]; ok {
+                    labels[rdsLabel + "is_cluster_writer"] = model.LabelValue("true")
+                } else {
+                    labels[rdsLabel + "is_cluster_writer"] = model.LabelValue("false")
+                }
 
-				labels[rdsLabelAZ] = model.LabelValue(*dbi.AvailabilityZone)
-				labels[rdsLabelInstanceState] = model.LabelValue(*dbi.DBInstanceStatus)
-				labels[rdsLabelInstanceType] = model.LabelValue(*dbi.DBInstanceClass)
+		labels[rdsLabelRegion] = model.LabelValue(*dbi.AvailabilityZone)[:len(model.LabelValue(*dbi.AvailabilityZone))-1]
 
-				addr := net.JoinHostPort(*dbi.Endpoint.Address, strconv.FormatInt(*dbi.Endpoint.Port, 10))
-				labels[model.AddressLabel] = model.LabelValue(addr)
+		tags, err := listTagsForInstance(client, dbi)
+		if err != nil {
+			level.Error(d.logger).Log("msg", "could not list tags for db instance", "err", err)
+		}
 
-				labels[rdsLabelEngine] = model.LabelValue(*dbi.Engine)
-				labels[rdsLabelEngineVersion] = model.LabelValue(*dbi.EngineVersion)
-
-				labels[rdsLabelVPCID] = model.LabelValue(*dbi.DBSubnetGroup.VpcId)
-
-				tags, err := listTagsForInstance(client, dbi)
-				if err != nil {
-					level.Error(d.logger).Log("msg", "could not list tags for db instance", "err", err)
-				}
-
-				for _, t := range tags.TagList {
-					if t == nil || t.Key == nil || t.Value == nil {
-						continue
-					}
-
-					name := strutil.SanitizeLabelName(*t.Key)
-					labels[rdsLabelTag+model.LabelName(name)] = model.LabelValue(*t.Value)
-				}
-
-				tgs = append(tgs, &targetgroup.Group{
-					Source:  *dbi.DBInstanceIdentifier,
-					Targets: []model.LabelSet{{model.AddressLabel: labels[model.AddressLabel]}},
-					Labels:  labels,
-				})
+		for _, t := range tags.TagList {
+			if t == nil || t.Key == nil || t.Value == nil {
+				continue
 			}
-			return true
-		}); err != nil {
-			level.Error(d.logger).Log("msg", "could not describe db instance", "err", err)
-			time.Sleep(time.Duration(d.refreshInterval) * time.Second)
-			continue
+
+			name := strutil.SanitizeLabelName(*t.Key)
+			labels[rdsLabelTag+model.LabelName(name)] = model.LabelValue(*t.Value)
 		}
 
-		ch <- tgs
+                tgs = append(tgs, &targetgroup.Group{
+                    Source:  *dbi.DBInstanceIdentifier,
+                    Targets: []model.LabelSet{{model.AddressLabel: labels[model.AddressLabel]}},
+                    Labels:  labels,
+                })
+            }
+            return true
+        }); err != nil {
+            	level.Error(d.logger).Log("msg", "could not describe db instances", "err", err)
+		time.Sleep(time.Duration(d.refreshInterval) * time.Second)
+            	continue
+        }
 
-		select {
-		case <-c:
-			continue
-		case <-ctx.Done():
-			return
-		}
-	}
+        ch <- tgs
+
+        select {
+        case <-c:
+            continue
+        case <-ctx.Done():
+            return
+        }
+    }
 }
+
 
 func listTagsForInstance(client *rds.RDS, dbi *rds.DBInstance) (*rds.ListTagsForResourceOutput, error) {
 	input := &rds.ListTagsForResourceInput{
